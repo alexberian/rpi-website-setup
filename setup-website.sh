@@ -222,14 +222,49 @@ site_address() {
 	fi
 }
 
+# The unit runs Caddy as an unprivileged user, so the log directory and file
+# have to belong to that user. Ask systemd who it is rather than assuming.
+caddy_service_user() {
+	local u
+	u="$(systemctl show caddy -p User --value 2>/dev/null || true)"
+	[[ -n "$u" ]] || u="caddy"
+	id -u "$u" >/dev/null 2>&1 || return 1
+	printf '%s' "$u"
+}
+
+# Make the log file writable by Caddy. Returns non-zero if that is not possible,
+# in which case the caller drops the log directive and Caddy logs to the journal
+# instead — an unwritable log path otherwise makes the whole config fail to load.
+prepare_logging() {
+	local cu logfile
+	cu="$(caddy_service_user)" || return 1
+	logfile="$LOG_DIR/$SITE_NAME.log"
+
+	mkdir -p "$LOG_DIR" 2>/dev/null || return 1
+	touch "$logfile" 2>/dev/null || return 1
+	chown "$cu" "$LOG_DIR" "$logfile" 2>/dev/null || true
+	chmod 755 "$LOG_DIR" 2>/dev/null || true
+	chmod 644 "$logfile" 2>/dev/null || true
+
+	# Verify as the service user rather than trusting the chown to have been enough.
+	if [[ "$cu" == "$(id -un)" ]]; then
+		test -w "$logfile"
+	else
+		runuser -u "$cu" -- test -w "$logfile" 2>/dev/null
+	fi
+}
+
 write_caddy_site() {
-	local root fragment try
+	local root fragment try log_block
 	root="$(site_root)/current"
 	fragment="$CADDY_SITES_DIR/$SITE_NAME.caddyfile"
 
-	# The package normally creates this, but Caddy fails to start if it is missing.
-	mkdir -p "$LOG_DIR"
-	if id -u caddy >/dev/null 2>&1; then chown caddy:caddy "$LOG_DIR" || true; fi
+	if prepare_logging; then
+		log_block=$'\tlog {\n\t\toutput file '"$LOG_DIR/$SITE_NAME.log"$' {\n\t\t\troll_size 10MiB\n\t\t\troll_keep 5\n\t\t}\n\t}'
+	else
+		log_block=$'\t# Access logs go to the journal: journalctl -u caddy'
+		step "$LOG_DIR is not writable by Caddy; logging to the journal instead"
+	fi
 
 	if [[ "$SPA" == "true" ]]; then
 		try='try_files {path} {path}/index.html {path}.html /index.html'
@@ -258,12 +293,7 @@ $(site_address) {
 	@html path *.html /
 	header @html Cache-Control "no-cache"
 
-	log {
-		output file $LOG_DIR/$SITE_NAME.log {
-			roll_size 10MiB
-			roll_keep 5
-		}
-	}
+$log_block
 }
 EOF
 	chmod 644 "$fragment"
@@ -288,17 +318,26 @@ reload_caddy() {
 # systemctl only says "job failed" and points at the journal. Go read it for the
 # user, and name the usual culprit — another service already holding the port.
 caddy_failure_report() {
-	local port; port="$(effective_port)"
-	printf '\n%sCaddy did not start.%s\n\n' "$RED$BOLD" "$RESET" >&2
+	local port summary; port="$(effective_port)"
+	summary="Caddy failed to start (details above)"
 
-	if command -v ss >/dev/null 2>&1; then
-		local holder
-		holder="$(ss -lntpH "sport = :$port" 2>/dev/null || true)"
-		if [[ -n "$holder" ]]; then
-			printf '%sPort %s is already taken by another service:%s\n' "$BOLD" "$port" "$RESET" >&2
-			printf '%s\n\n' "$holder" >&2
-			printf 'Stop whatever owns it, or serve elsewhere:\n' >&2
-			printf '  setup-website.sh --port 8080 --reconfigure\n\n' >&2
+	if systemctl is-active --quiet caddy; then
+		summary="Caddy rejected the new config (details above); the previous one is still live"
+		# Caddy refused the new config and kept the old one, so the site stays up.
+		printf '\n%sCaddy rejected the new configuration.%s\n' "$YELLOW$BOLD" "$RESET" >&2
+		printf 'It is still serving the previous config, so the site is not down.\n\n' >&2
+	else
+		printf '\n%sCaddy did not start.%s\n\n' "$RED$BOLD" "$RESET" >&2
+		if command -v ss >/dev/null 2>&1; then
+			local holder
+			holder="$(ss -lntpH "sport = :$port" 2>/dev/null || true)"
+			# Only a conflict if something *other than* Caddy holds the port.
+			if [[ -n "$holder" && "$holder" != *'"caddy"'* ]]; then
+				printf '%sPort %s is already taken by another service:%s\n' "$BOLD" "$port" "$RESET" >&2
+				printf '%s\n\n' "$holder" >&2
+				printf 'Stop whatever owns it, or serve elsewhere:\n' >&2
+				printf '  setup-website.sh --port 8080 --reconfigure\n\n' >&2
+			fi
 		fi
 	fi
 
@@ -306,7 +345,7 @@ caddy_failure_report() {
 	journalctl -u caddy -n 25 --no-pager 2>/dev/null \
 		| sed 's/^/  /' >&2 || printf '  (journal unavailable)\n' >&2
 	echo >&2
-	die "Caddy failed to start (details above)"
+	die "$summary"
 }
 
 # ------------------------------------------------------------- zip handling ---
