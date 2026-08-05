@@ -1,4 +1,4 @@
-# pi-website-deploy
+# rpi-website-setup
 
 Deploy a static website to a Raspberry Pi from a `.zip`, with one command.
 
@@ -17,8 +17,8 @@ atomically, so a deploy is instant and rolling back is one command.
 On the Pi:
 
 ```bash
-git clone https://github.com/alexberian/pi-website-deploy.git
-cd pi-website-deploy
+git clone https://github.com/alexberian/rpi-website-setup.git
+cd rpi-website-setup
 sudo ./install.sh          # optional: puts setup-website.sh on your PATH
 ```
 
