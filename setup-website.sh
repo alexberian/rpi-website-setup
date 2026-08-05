@@ -275,14 +275,38 @@ reload_caddy() {
 		caddy validate --config "$CADDYFILE" --adapter caddyfile || true
 		die "Caddy rejected the generated config (see above)"
 	fi
-	systemctl enable --now caddy >/dev/null 2>&1 || true
+	systemctl enable caddy >/dev/null 2>&1 || true
 	if systemctl is-active --quiet caddy; then
-		systemctl reload caddy
+		systemctl reload caddy >/dev/null 2>&1 || caddy_failure_report
 	else
-		systemctl restart caddy
+		systemctl restart caddy >/dev/null 2>&1 || caddy_failure_report
 	fi
-	systemctl is-active --quiet caddy || die "Caddy failed to start: journalctl -u caddy -n 50"
+	systemctl is-active --quiet caddy || caddy_failure_report
 	ok "Caddy reloaded"
+}
+
+# systemctl only says "job failed" and points at the journal. Go read it for the
+# user, and name the usual culprit — another service already holding the port.
+caddy_failure_report() {
+	local port; port="$(effective_port)"
+	printf '\n%sCaddy did not start.%s\n\n' "$RED$BOLD" "$RESET" >&2
+
+	if command -v ss >/dev/null 2>&1; then
+		local holder
+		holder="$(ss -lntpH "sport = :$port" 2>/dev/null || true)"
+		if [[ -n "$holder" ]]; then
+			printf '%sPort %s is already taken by another service:%s\n' "$BOLD" "$port" "$RESET" >&2
+			printf '%s\n\n' "$holder" >&2
+			printf 'Stop whatever owns it, or serve elsewhere:\n' >&2
+			printf '  setup-website.sh --port 8080 --reconfigure\n\n' >&2
+		fi
+	fi
+
+	printf '%sLast lines from the Caddy journal:%s\n' "$BOLD" "$RESET" >&2
+	journalctl -u caddy -n 25 --no-pager 2>/dev/null \
+		| sed 's/^/  /' >&2 || printf '  (journal unavailable)\n' >&2
+	echo >&2
+	die "Caddy failed to start (details above)"
 }
 
 # ------------------------------------------------------------- zip handling ---
