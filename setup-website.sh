@@ -38,9 +38,11 @@ if [[ -t 1 ]]; then
 	YELLOW=$'\033[33m'; BLUE=$'\033[34m'; RESET=$'\033[0m'
 fi
 
-info()  { printf '%s==>%s %s\n' "$BLUE$BOLD" "$RESET" "$*"; }
-step()  { printf '  %s->%s %s\n' "$DIM" "$RESET" "$*"; }
-ok()    { printf '  %s+%s %s\n' "$GREEN" "$RESET" "$*"; }
+# All progress logging goes to stderr, so a function that reports progress can
+# still return a value through stdout via command substitution.
+info()  { printf '%s==>%s %s\n' "$BLUE$BOLD" "$RESET" "$*" >&2; }
+step()  { printf '  %s->%s %s\n' "$DIM" "$RESET" "$*" >&2; }
+ok()    { printf '  %s+%s %s\n' "$GREEN" "$RESET" "$*" >&2; }
 warn()  { printf '  %s!%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
 die()   { printf '%serror:%s %s\n' "$RED$BOLD" "$RESET" "$*" >&2; exit 1; }
 
@@ -309,10 +311,39 @@ extract_zip() {
 	find "$dest" -name '__MACOSX' -type d -prune -exec rm -rf {} + 2>/dev/null || true
 	find "$dest" -name '.DS_Store' -type f -delete 2>/dev/null || true
 
+	# Prefer a real index.html, matched case-insensitively.
 	local index
-	index="$(find "$dest" -name 'index.html' -type f -printf '%d\t%p\n' 2>/dev/null \
+	index="$(find "$dest" -iname 'index.html' -type f -printf '%d\t%p\n' 2>/dev/null \
 		| sort -n | head -1 | cut -f2-)"
-	[[ -n "$index" ]] || die "archive has no index.html — is this a static website zip?"
+
+	# Otherwise fall back to the shallowest .html file. Downloads are often named
+	# after the project ("Tucson landscaping.html") rather than index.html, so
+	# promote that page to the site's entry point.
+	if [[ -z "$index" ]]; then
+		local page
+		page="$(find "$dest" -iname '*.html' -type f -printf '%d\t%p\n' 2>/dev/null \
+			| sort -n | head -1 | cut -f2-)"
+		if [[ -n "$page" ]]; then
+			step "no index.html; using $(basename "$page") as the home page"
+			cp "$page" "$(dirname "$page")/index.html"
+			index="$(dirname "$page")/index.html"
+		fi
+	fi
+
+	if [[ -z "$index" ]]; then
+		printf '\n%sThe archive contains no .html file. Its contents:%s\n' "$BOLD" "$RESET" >&2
+		find "$dest" -mindepth 1 -maxdepth 3 -printf '  %P\n' 2>/dev/null | sort | head -40 >&2
+		local total; total="$(find "$dest" -mindepth 1 | wc -l)"
+		[[ "$total" -gt 40 ]] && printf '  ... and %s more entries\n' "$((total - 40))" >&2
+		echo >&2
+		die "no web page found — this does not look like a static website zip"
+	fi
+
+	# Case-insensitive match may have found INDEX.HTML; Caddy needs the lowercase name.
+	if [[ "$(basename "$index")" != "index.html" ]]; then
+		mv "$index" "$(dirname "$index")/index.html"
+		index="$(dirname "$index")/index.html"
+	fi
 
 	dirname "$index"
 }
